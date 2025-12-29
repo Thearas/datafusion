@@ -33,7 +33,8 @@ use crate::spill::get_record_batch_memory_size;
 use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow_schema::SortOptions;
 use datafusion_common::{
     HashMap, Result, ScalarValue, internal_datafusion_err, internal_err,
 };
@@ -113,6 +114,8 @@ pub struct TopK {
     batch_size: usize,
     /// sort expressions
     expr: LexOrdering,
+    /// Optimization mode for this TopK
+    mode: TopKMode,
     /// row converter, for sort keys
     row_converter: RowConverter,
     /// scratch space for converting rows
@@ -159,6 +162,25 @@ impl TopKDynamicFilters {
 // Guesstimate for memory allocation: estimated number of bytes used per row in the RowConverter
 const ESTIMATED_BYTES_PER_ROW: usize = 20;
 
+/// Optimization mode for TopK based on sort column types
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TopKMode {
+    /// Use RowConverter for all cases (default)
+    Generic,
+    /// Optimized path for single Int32 column
+    Int32,
+    /// Optimized path for single Int64 column
+    Int64,
+    /// Optimized path for single Float32 column
+    Float32,
+    /// Optimized path for single Float64 column
+    Float64,
+    /// Optimized path for single UInt32 column
+    UInt32,
+    /// Optimized path for single UInt64 column
+    UInt64,
+}
+
 fn build_sort_fields(
     ordering: &[PhysicalSortExpr],
     schema: &SchemaRef,
@@ -172,6 +194,25 @@ fn build_sort_fields(
             ))
         })
         .collect::<Result<_>>()
+}
+
+/// Determine if we can use an optimized path for single-column primitive sorts
+fn detect_topk_mode(expr: &[PhysicalSortExpr], schema: &SchemaRef) -> Result<TopKMode> {
+    // Only optimize for single-column sorts
+    if expr.len() != 1 {
+        return Ok(TopKMode::Generic);
+    }
+
+    let data_type = expr[0].expr.data_type(schema)?;
+    Ok(match data_type {
+        DataType::Int32 => TopKMode::Int32,
+        DataType::Int64 => TopKMode::Int64,
+        DataType::Float32 => TopKMode::Float32,
+        DataType::Float64 => TopKMode::Float64,
+        DataType::UInt32 => TopKMode::UInt32,
+        DataType::UInt64 => TopKMode::UInt64,
+        _ => TopKMode::Generic,
+    })
 }
 
 impl TopK {
@@ -196,8 +237,9 @@ impl TopK {
 
         let sort_fields = build_sort_fields(&expr, &schema)?;
 
-        // TODO there is potential to add special cases for single column sort fields
-        // to improve performance
+        // Detect if we can use an optimized path for single-column primitive sorts
+        let mode = detect_topk_mode(&expr, &schema)?;
+        
         let row_converter = RowConverter::new(sort_fields)?;
         let scratch_rows =
             row_converter.empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
@@ -209,15 +251,22 @@ impl TopK {
             Some(RowConverter::new(input_sort_fields)?)
         };
 
+        let mut heap = TopKHeap::new(k, batch_size, mode);
+        // Set sort options for primitive mode
+        if mode != TopKMode::Generic {
+            heap.set_sort_options(expr[0].options);
+        }
+
         Ok(Self {
             schema: Arc::clone(&schema),
             metrics: TopKMetrics::new(metrics, partition_id),
             reservation,
             batch_size,
             expr,
+            mode,
             row_converter,
             scratch_rows,
-            heap: TopKHeap::new(k, batch_size),
+            heap,
             common_sort_prefix_converter: prefix_row_converter,
             common_sort_prefix: Arc::from(common_sort_prefix),
             finished: false,
@@ -277,18 +326,32 @@ impl TopK {
                 .map(|key| filter_predicate.filter(key).map_err(|x| x.into()))
                 .collect::<Result<Vec<_>>>()?;
         }
-        // reuse existing `Rows` to avoid reallocations
-        let rows = &mut self.scratch_rows;
-        rows.clear();
-        self.row_converter.append(rows, &sort_keys)?;
-
+        
         let mut batch_entry = self.heap.register_batch(batch.clone());
 
-        let replacements = match selected_rows {
-            Some(filter) => {
-                self.find_new_topk_items(filter.values().set_indices(), &mut batch_entry)
+        // Choose between generic and optimized path
+        let replacements = if self.mode == TopKMode::Generic {
+            // Generic path: use RowConverter
+            let rows = &mut self.scratch_rows;
+            rows.clear();
+            self.row_converter.append(rows, &sort_keys)?;
+            
+            match selected_rows {
+                Some(filter) => {
+                    self.find_new_topk_items(filter.values().set_indices(), &mut batch_entry)
+                }
+                None => self.find_new_topk_items(0..sort_keys[0].len(), &mut batch_entry),
             }
-            None => self.find_new_topk_items(0..sort_keys[0].len(), &mut batch_entry),
+        } else {
+            // Optimized path: use primitive values directly
+            match selected_rows {
+                Some(filter) => {
+                    self.find_new_topk_items_primitive(&sort_keys[0], filter.values().set_indices().collect::<Vec<_>>(), &mut batch_entry)?
+                }
+                None => {
+                    self.find_new_topk_items_primitive(&sort_keys[0], (0..sort_keys[0].len()).collect::<Vec<_>>(), &mut batch_entry)?
+                }
+            }
         };
 
         if replacements > 0 {
@@ -336,6 +399,73 @@ impl TopK {
         replacements
     }
 
+    /// Find new topk items using primitive values directly (optimized path)
+    fn find_new_topk_items_primitive(
+        &mut self,
+        array: &ArrayRef,
+        indices: Vec<usize>,
+        batch_entry: &mut RecordBatchEntry,
+    ) -> Result<usize> {
+        let mut replacements = 0;
+        
+        for index in indices {
+            let value = self.extract_primitive_value(array, index)?;
+            
+            // Create a temporary TopKRow for comparison
+            let temp_row = TopKRow::new_primitive(
+                value.clone(),
+                batch_entry.id,
+                index,
+                self.expr[0].options,
+            );
+            
+            match self.heap.max() {
+                // heap has k items, and the new row is greater than or equal to
+                // the current max in the heap ==> it is not a new topk
+                Some(max_row) if temp_row >= *max_row => {}
+                // don't yet have k items or new item is lower than the currently k low values
+                None | Some(_) => {
+                    self.heap.add_primitive(batch_entry, value, index);
+                    replacements += 1;
+                }
+            }
+        }
+        Ok(replacements)
+    }
+
+    /// Extract a primitive value from an array at a given index
+    fn extract_primitive_value(&self, array: &ArrayRef, index: usize) -> Result<TopKValue> {
+        Ok(match self.mode {
+            TopKMode::Int32 => {
+                let arr = array.as_primitive::<arrow::datatypes::Int32Type>();
+                TopKValue::Int32(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::Int64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
+                TopKValue::Int64(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::Float32 => {
+                let arr = array.as_primitive::<arrow::datatypes::Float32Type>();
+                TopKValue::Float32(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::Float64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
+                TopKValue::Float64(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::UInt32 => {
+                let arr = array.as_primitive::<arrow::datatypes::UInt32Type>();
+                TopKValue::UInt32(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::UInt64 => {
+                let arr = array.as_primitive::<arrow::datatypes::UInt64Type>();
+                TopKValue::UInt64(if arr.is_null(index) { None } else { Some(arr.value(index)) })
+            }
+            TopKMode::Generic => {
+                return internal_err!("extract_primitive_value called in Generic mode");
+            }
+        })
+    }
+
     /// Update the filter representation of our TopK heap.
     /// For example, given the sort expression `ORDER BY a DESC, b ASC LIMIT 3`,
     /// and the current heap values `[(1, 5), (1, 4), (2, 3)]`,
@@ -352,20 +482,30 @@ impl TopK {
             return Ok(());
         };
 
-        let new_threshold_row = &max_row.row;
+        // For primitive mode, we can skip the byte comparison and use the TopKRow comparison directly
+        // For generic mode, we need to get the byte representation for comparison
+        let new_threshold_bytes = if self.mode == TopKMode::Generic {
+            Some(max_row.row().to_vec())
+        } else {
+            None
+        };
 
         // Fast path: check if the current value in topk is better than what is
         // currently set in the filter with a read only lock
-        let needs_update = self
-            .filter
-            .read()
-            .threshold_row
-            .as_ref()
-            .map(|current_row| {
-                // new < current means new threshold is more selective
-                new_threshold_row < current_row
-            })
-            .unwrap_or(true); // No current threshold, so we need to set one
+        let needs_update = if let Some(ref bytes) = new_threshold_bytes {
+            self.filter
+                .read()
+                .threshold_row
+                .as_ref()
+                .map(|current_row| {
+                    // new < current means new threshold is more selective
+                    bytes.as_slice() < current_row.as_slice()
+                })
+                .unwrap_or(true) // No current threshold, so we need to set one
+        } else {
+            // For primitive mode, always update (we could optimize this further later)
+            true
+        };
 
         // exit early if the current values are better
         if !needs_update {
@@ -380,7 +520,6 @@ impl TopK {
 
         // Build the filter expression OUTSIDE any synchronization
         let predicate = Self::build_filter_expression(&self.expr, &thresholds)?;
-        let new_threshold = new_threshold_row.to_vec();
 
         // update the threshold. Since there was a lock gap, we must check if it is still the best
         // may have changed while we were building the expression without the lock
@@ -389,24 +528,30 @@ impl TopK {
 
         // Update filter if we successfully updated the threshold
         // (or if there was no previous threshold and we're the first)
-        match old_threshold {
-            Some(old_threshold) => {
-                // new threshold is still better than the old one
-                if new_threshold.as_slice() < old_threshold.as_slice() {
-                    filter.threshold_row = Some(new_threshold);
-                } else {
-                    // some other thread updated the threshold to a better
-                    // one while we were building so there is no need to
-                    // update the filter
-                    filter.threshold_row = Some(old_threshold);
-                    return Ok(());
+        if let Some(ref new_bytes) = new_threshold_bytes {
+            match old_threshold {
+                Some(old_threshold) => {
+                    // new threshold is still better than the old one
+                    if new_bytes.as_slice() < old_threshold.as_slice() {
+                        filter.threshold_row = Some(new_bytes.clone());
+                    } else {
+                        // some other thread updated the threshold to a better
+                        // one while we were building so there is no need to
+                        // update the filter
+                        filter.threshold_row = Some(old_threshold);
+                        return Ok(());
+                    }
                 }
-            }
-            None => {
-                // No previous threshold, so we can set the new one
-                filter.threshold_row = Some(new_threshold);
-            }
-        };
+                None => {
+                    // No previous threshold, so we can set the new one
+                    filter.threshold_row = Some(new_bytes.clone());
+                }
+            };
+        } else {
+            // For primitive mode, just update without byte comparison
+            // (could be improved to do comparison in the future)
+            filter.threshold_row = None;
+        }
 
         // Update the filter expression
         if let Some(pred) = predicate
@@ -587,6 +732,7 @@ impl TopK {
             reservation: _,
             batch_size,
             expr: _,
+            mode: _,
             row_converter: _,
             scratch_rows: _,
             mut heap,
@@ -661,6 +807,11 @@ struct TopKHeap {
     k: usize,
     /// The target number of rows for output batches
     batch_size: usize,
+    /// Optimization mode (used for comparison logic)
+    #[allow(dead_code)]
+    mode: TopKMode,
+    /// Sort options for primitive comparisons
+    sort_options: Option<SortOptions>,
     /// Storage for up at most `k` items using a BinaryHeap. Reversed
     /// so that the smallest k so far is on the top
     inner: BinaryHeap<TopKRow>,
@@ -671,15 +822,21 @@ struct TopKHeap {
 }
 
 impl TopKHeap {
-    fn new(k: usize, batch_size: usize) -> Self {
+    fn new(k: usize, batch_size: usize, mode: TopKMode) -> Self {
         assert!(k > 0);
         Self {
             k,
             batch_size,
+            mode,
+            sort_options: None,
             inner: BinaryHeap::new(),
             store: RecordBatchStore::new(),
             owned_bytes: 0,
         }
+    }
+
+    fn set_sort_options(&mut self, options: SortOptions) {
+        self.sort_options = Some(options);
     }
 
     /// Register a [`RecordBatch`] with the heap, returning the
@@ -736,6 +893,44 @@ impl TopKHeap {
             prev_min.with_new_row(row, batch_id, index)
         } else {
             TopKRow::new(row, batch_id, index)
+        };
+
+        self.owned_bytes += new_top_k.owned_size();
+
+        // put the new row into the heap
+        self.inner.push(new_top_k)
+    }
+
+    /// Adds a primitive value to this heap. If inserting this new item would
+    /// increase the size past `k`, removes the previously smallest item.
+    fn add_primitive(
+        &mut self,
+        batch_entry: &mut RecordBatchEntry,
+        value: TopKValue,
+        index: usize,
+    ) {
+        let batch_id = batch_entry.id;
+        batch_entry.uses += 1;
+
+        assert!(self.inner.len() <= self.k);
+
+        // Reuse storage for evicted item if possible
+        let new_top_k = if self.inner.len() == self.k {
+            let prev_min = self.inner.pop().unwrap();
+
+            // Update batch use
+            if prev_min.batch_id == batch_entry.id {
+                batch_entry.uses -= 1;
+            } else {
+                self.store.unuse(prev_min.batch_id);
+            }
+
+            // update memory accounting
+            self.owned_bytes -= prev_min.owned_size();
+            prev_min.with_new_primitive(value, batch_id, index)
+        } else {
+            let sort_options = self.sort_options.expect("Sort options required for primitive mode");
+            TopKRow::new_primitive(value, batch_id, index, sort_options)
         };
 
         self.owned_bytes += new_top_k.owned_size();
@@ -881,6 +1076,41 @@ impl TopKHeap {
     }
 }
 
+/// Represents the sort key value for efficient comparison
+#[derive(Debug, Clone, PartialEq)]
+enum TopKValue {
+    /// Optimized storage for Int32
+    Int32(Option<i32>),
+    /// Optimized storage for Int64
+    Int64(Option<i64>),
+    /// Optimized storage for Float32
+    Float32(Option<f32>),
+    /// Optimized storage for Float64
+    Float64(Option<f64>),
+    /// Optimized storage for UInt32
+    UInt32(Option<u32>),
+    /// Optimized storage for UInt64
+    UInt64(Option<u64>),
+    /// Generic row format for complex types
+    Row(Vec<u8>),
+}
+
+impl TopKValue {
+    fn owned_size(&self) -> usize {
+        match self {
+            TopKValue::Row(v) => v.capacity(),
+            _ => 0, // Primitive types stored inline
+        }
+    }
+
+    fn as_row(&self) -> &[u8] {
+        match self {
+            TopKValue::Row(v) => v.as_slice(),
+            _ => panic!("Cannot get row bytes from primitive value"),
+        }
+    }
+}
+
 /// Represents one of the top K rows held in this heap. Orders
 /// according to memcmp of row (e.g. the arrow Row format, but could
 /// also be primitive values)
@@ -888,27 +1118,43 @@ impl TopKHeap {
 /// Reuses allocations to minimize runtime overhead of creating new Vecs
 #[derive(Debug, PartialEq)]
 struct TopKRow {
-    /// the value of the sort key for this row. This contains the
-    /// bytes that could be stored in `OwnedRow` but uses `Vec<u8>` to
-    /// reuse allocations.
-    row: Vec<u8>,
+    /// the value of the sort key for this row
+    value: TopKValue,
     /// the RecordBatch this row came from: an id into a [`RecordBatchStore`]
     batch_id: u32,
     /// the index in this record batch the row came from
     index: usize,
+    /// Sort options for comparison (only used for primitive types)
+    sort_options: Option<SortOptions>,
 }
 
 impl TopKRow {
-    /// Create a new TopKRow with new allocation
+    /// Create a new TopKRow with row bytes (for generic mode)
     fn new(row: impl AsRef<[u8]>, batch_id: u32, index: usize) -> Self {
         Self {
-            row: row.as_ref().to_vec(),
+            value: TopKValue::Row(row.as_ref().to_vec()),
             batch_id,
             index,
+            sort_options: None,
         }
     }
 
-    /// Create a new  TopKRow reusing the existing allocation
+    /// Create a new TopKRow with primitive value (for optimized mode)
+    fn new_primitive(
+        value: TopKValue,
+        batch_id: u32,
+        index: usize,
+        sort_options: SortOptions,
+    ) -> Self {
+        Self {
+            value,
+            batch_id,
+            index,
+            sort_options: Some(sort_options),
+        }
+    }
+
+    /// Create a new TopKRow reusing the existing allocation (for generic mode)
     fn with_new_row(
         self,
         new_row: impl AsRef<[u8]>,
@@ -916,29 +1162,53 @@ impl TopKRow {
         index: usize,
     ) -> Self {
         let Self {
-            mut row,
+            value,
             batch_id: _,
             index: _,
+            sort_options,
         } = self;
-        row.clear();
-        row.extend_from_slice(new_row.as_ref());
+        
+        let new_value = match value {
+            TopKValue::Row(mut row) => {
+                row.clear();
+                row.extend_from_slice(new_row.as_ref());
+                TopKValue::Row(row)
+            }
+            _ => TopKValue::Row(new_row.as_ref().to_vec()),
+        };
 
         Self {
-            row,
+            value: new_value,
             batch_id,
             index,
+            sort_options,
+        }
+    }
+
+    /// Create a new TopKRow with new primitive value, reusing allocation if possible
+    fn with_new_primitive(
+        self,
+        new_value: TopKValue,
+        batch_id: u32,
+        index: usize,
+    ) -> Self {
+        Self {
+            value: new_value,
+            batch_id,
+            index,
+            sort_options: self.sort_options,
         }
     }
 
     /// Returns the number of bytes owned by this row in the heap (not
     /// including itself)
     fn owned_size(&self) -> usize {
-        self.row.capacity()
+        self.value.owned_size()
     }
 
-    /// Returns a slice to the owned row value
+    /// Returns a slice to the owned row value (for generic mode)
     fn row(&self) -> &[u8] {
-        self.row.as_slice()
+        self.value.as_row()
     }
 }
 
@@ -946,14 +1216,57 @@ impl Eq for TopKRow {}
 
 impl PartialOrd for TopKRow {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // TODO PartialOrd is not consistent with PartialEq; PartialOrd contract is violated
         Some(self.cmp(other))
     }
 }
 
 impl Ord for TopKRow {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.row.cmp(&other.row)
+        use TopKValue::*;
+        
+        match (&self.value, &other.value) {
+            (Row(a), Row(b)) => a.cmp(b),
+            (Int32(a), Int32(b)) => self.cmp_primitive(a, b),
+            (Int64(a), Int64(b)) => self.cmp_primitive(a, b),
+            (Float32(a), Float32(b)) => self.cmp_primitive(a, b),
+            (Float64(a), Float64(b)) => self.cmp_primitive(a, b),
+            (UInt32(a), UInt32(b)) => self.cmp_primitive(a, b),
+            (UInt64(a), UInt64(b)) => self.cmp_primitive(a, b),
+            _ => panic!("Cannot compare different TopKValue variants"),
+        }
+    }
+}
+
+impl TopKRow {
+    fn cmp_primitive<T: PartialOrd>(&self, a: &Option<T>, b: &Option<T>) -> Ordering {
+        let opts = self.sort_options.expect("Sort options required for primitive comparison");
+        
+        let ord = match (a, b) {
+            (Some(a_val), Some(b_val)) => {
+                a_val.partial_cmp(b_val).unwrap_or(Ordering::Equal)
+            }
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => {
+                if opts.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Some(_), None) => {
+                if opts.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+        };
+
+        if opts.descending {
+            ord.reverse()
+        } else {
+            ord
+        }
     }
 }
 
