@@ -1564,4 +1564,208 @@ mod tests {
 
         Ok(())
     }
+
+    /// Test that the optimization is correctly applied for single-column primitive types
+    #[tokio::test]
+    async fn test_primitive_topk_optimization() -> Result<()> {
+        // Test Int32
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let full_expr = LexOrdering::from([sort_expr.clone()]);
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            3,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Verify optimization mode was detected
+        assert_eq!(topk.mode, TopKMode::Int32);
+
+        // Insert batch with values [5, 2, 8, 1, 6, 3]
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![5, 2, 8, 1, 6, 3]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+        topk.insert_batch(batch)?;
+
+        // Emit results and verify we get the top 3 smallest values: [1, 2, 3]
+        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        assert_batches_eq!(
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 1 |",
+                "| 2 |",
+                "| 3 |",
+                "+---+",
+            ],
+            &results
+        );
+
+        Ok(())
+    }
+
+    /// Test primitive optimization with descending sort
+    #[tokio::test]
+    async fn test_primitive_topk_descending() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("val", schema.as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+        let full_expr = LexOrdering::from([sort_expr]);
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            3,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Verify optimization mode was detected
+        assert_eq!(topk.mode, TopKMode::Int64);
+
+        // Insert batch with values [5, 2, 8, 1, 6, 3]
+        let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![5i64, 2, 8, 1, 6, 3]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+        topk.insert_batch(batch)?;
+
+        // Emit results and verify we get the top 3 largest values: [8, 6, 5]
+        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        assert_batches_eq!(
+            &[
+                "+-----+",
+                "| val |",
+                "+-----+",
+                "| 8   |",
+                "| 6   |",
+                "| 5   |",
+                "+-----+",
+            ],
+            &results
+        );
+
+        Ok(())
+    }
+
+    /// Test primitive optimization with nulls
+    #[tokio::test]
+    async fn test_primitive_topk_with_nulls() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Float64, true)]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("val", schema.as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let full_expr = LexOrdering::from([sort_expr]);
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            4,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Verify optimization mode was detected
+        assert_eq!(topk.mode, TopKMode::Float64);
+
+        // Insert batch with nulls: [Some(5.0), None, Some(2.0), None, Some(3.0)]
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![Some(5.0), None, Some(2.0), None, Some(3.0)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+        topk.insert_batch(batch)?;
+
+        // Emit results and verify we get: [None, None, 2.0, 3.0] (nulls first)
+        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        assert_batches_eq!(
+            &[
+                "+-----+",
+                "| val |",
+                "+-----+",
+                "|     |",
+                "|     |",
+                "| 2.0 |",
+                "| 3.0 |",
+                "+-----+",
+            ],
+            &results
+        );
+
+        Ok(())
+    }
+
+    /// Test that multi-column sorts use generic mode
+    #[test]
+    fn test_multi_column_uses_generic_mode() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        
+        let sort_expr_a = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let sort_expr_b = PhysicalSortExpr {
+            expr: col("b", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let full_expr = LexOrdering::from([sort_expr_a, sort_expr_b]);
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        
+        let topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            3,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Verify generic mode is used for multi-column sorts
+        assert_eq!(topk.mode, TopKMode::Generic);
+
+        Ok(())
+    }
 }
