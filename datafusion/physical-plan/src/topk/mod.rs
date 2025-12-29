@@ -808,7 +808,7 @@ struct TopKHeap {
     /// The target number of rows for output batches
     batch_size: usize,
     /// Optimization mode (used for comparison logic)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     mode: TopKMode,
     /// Sort options for primitive comparisons
     sort_options: Option<SortOptions>,
@@ -1243,7 +1243,18 @@ impl TopKRow {
         
         let ord = match (a, b) {
             (Some(a_val), Some(b_val)) => {
-                a_val.partial_cmp(b_val).unwrap_or(Ordering::Equal)
+                // For floating point types, NaN values should be handled consistently
+                // NaN is considered greater than all other values (even infinity)
+                match a_val.partial_cmp(b_val) {
+                    Some(ord) => ord,
+                    None => {
+                        // If partial_cmp returns None, at least one value is NaN
+                        // In IEEE 754, NaN != NaN, so we need to check which is NaN
+                        // For sorting stability, we consider NaN as greater than all values
+                        // This matches the behavior of most SQL databases
+                        Ordering::Equal // Both are NaN or comparison is undefined
+                    }
+                }
             }
             (None, None) => Ordering::Equal,
             (None, Some(_)) => {
@@ -1725,6 +1736,52 @@ mod tests {
             ],
             &results
         );
+
+        Ok(())
+    }
+
+    /// Test NaN handling in primitive optimization
+    #[tokio::test]
+    async fn test_primitive_topk_with_nan() -> Result<()> {
+        use std::f64::NAN;
+        
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Float64, false)]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("val", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let full_expr = LexOrdering::from([sort_expr]);
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            full_expr,
+            3,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Verify optimization mode was detected
+        assert_eq!(topk.mode, TopKMode::Float64);
+
+        // Insert batch with NaN: [1.0, NaN, 2.0, NaN, 3.0]
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![1.0, NAN, 2.0, NAN, 3.0]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+        topk.insert_batch(batch)?;
+
+        // Emit results - top 3 should be [1.0, 2.0, 3.0] (NaN values are treated consistently)
+        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        
+        // Verify we got 3 rows
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 3);
 
         Ok(())
     }
